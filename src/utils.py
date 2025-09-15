@@ -44,49 +44,67 @@ def db_connection():
 
 
 
-def notify_jobs(conn, cur, notification_title: str, query: str):
+def notify_jobs(cur, notification_title: str, query: str, new_job_ids: list | None = None):
     """
-    Fetch jobs from the database using the given SQL query,
-    format them into a string, and send a notification via ntfy.
+    Fetch matching jobs from the database and send a formatted notification
+    to an ntfy topic.
 
     Args:
-        conn (psycopg2.extensions.connection): Active database connection.
-        cur (psycopg2.extensions.cursor): Cursor object for executing queries.
-        notification_title (str): Title to display in the ntfy notification.
-        query (str): SQL query to fetch job records. 
-                     The query must return at least:
-                     - id
-                     - title
-                     - link
-                     - published
-                     - author
-                     - category
-                     - fetched_at
+        cur (psycopg2.extensions.cursor):
+            Active database cursor used to execute SQL.
+        notification_title (str):
+            Title text to display in the ntfy notification header.
+        query (str):
+            SQL query to run when `new_job_ids` is not provided.
+            Must return the following columns:
+                id, title, link, published, author, category, fetched_at
+        new_job_ids (list[int] | None, optional):
+            If provided, overrides `query` and limits the notification
+            to rows whose `id` is in this list **and** whose
+            `application_status` is 'pending'.
 
     Returns:
-        list[int]: A list of job IDs that were included in the notification.
-                   Returns an empty list if no jobs are found.
+        list[int]:
+            A list of job IDs included in the notification.
+            Returns an empty list if no rows match.
 
-    Side Effects:
-        - Closes the cursor and connection if no jobs are found.
+    Behavior:
+        When `new_job_ids` is given:
+            Executes a parameterized query:
+                SELECT id, title, link, published, author, category, fetched_at
+                FROM jobs
+                WHERE id = ANY(%s) AND application_status = 'pending'
+        Otherwise:
+            Executes the supplied `query` as-is.
+
+        The resulting rows are converted to dictionaries, formatted as
+        a Markdown string, and sent to the ntfy topic defined by the
+        global `ntfy_topic` variable.
 
     Raises:
-        Exception: Propagates any exceptions raised during query execution 
-                   or the notification request.
+        Exception:
+            Propagates any database or network errors encountered while
+            executing the query or posting the notification.
     """
-    cur = conn.cursor()
+
 
     # Run the query to fetch jobs
-    cur.execute(query)
-    rows = cur.fetchall()
+    if new_job_ids:
+        print(f"new_job_ids: {new_job_ids}")
+        query="""
+            SELECT id, title, link, published, author, category, fetched_at 
+            FROM jobs 
+            WHERE id = ANY(%s) AND application_status = 'pending'
+        """
+        cur.execute(query, (new_job_ids,))
+        rows = cur.fetchall()
+    else:
+        cur.execute(query)
+        rows = cur.fetchall()
+
     columns = [desc[0] for desc in cur.description]
     jobs = [dict(zip(columns, row)) for row in rows]
 
-    # If no jobs were found, clean up and return
-    if not jobs:
-        conn.close()
-        cur.close()
-        return []
 
     # Format job details into a single string
     job_string = "\n\n".join(
@@ -117,48 +135,59 @@ def notify_jobs(conn, cur, notification_title: str, query: str):
 
 
 
-def insert_jobs(jobs, notification_title: str):
+def insert_jobs(conn, cur, jobs: list[dict], notification_title: str):
     """
-    Insert a list of job dictionaries into the `jobs` table and 
-    trigger a notification for newly inserted jobs.
+    Bulk-insert new job postings into the `jobs` table and notify about
+    any rows that were actually inserted.
 
     Args:
-        jobs (list[dict]): 
-            A list of job records. Each dictionary must contain the keys:
-            - title (str): Job title
-            - link (str): Unique job URL (used for conflict resolution)
-            - published (datetime or str): Published timestamp
-            - author (str): Job author / organization
-            - category (str): Job category
-            - fetched_at (datetime or str): Timestamp when the job was fetched
-        notification_title (str): 
-            The title of the notification sent after insertion.
+        conn (psycopg2.extensions.connection):
+            Active PostgreSQL connection object.
+        cur (psycopg2.extensions.cursor):
+            Cursor bound to `conn` for executing SQL.
+        jobs (list[dict]):
+            List of job records. Each dictionary must include:
+                - title (str)       : Job title.
+                - link (str)        : Unique job URL (used for conflict detection).
+                - published (datetime | str): Published timestamp.
+                - author (str)      : Job author / organization.
+                - category (str)    : Job category or type.
+                - fetched_at (datetime | str): Timestamp of the fetch.
+        notification_title (str):
+            Title to display in the ntfy notification triggered after insertion.
 
     Workflow:
-        1. Establish a database connection.
-        2. Prepare the job data as tuples and insert into the `jobs` table.
-           - Uses `ON CONFLICT (link) DO NOTHING` to skip duplicates.
-        3. Commit the transaction.
-        4. Send a notification containing all jobs with 
-           `application_status = 'pending'`.
+        1. Prepares a bulk INSERT statement:
+               INSERT INTO jobs (title, link, published, author, category, fetched_at)
+               VALUES %s
+               ON CONFLICT (link) DO NOTHING
+               RETURNING id;
+           • `ON CONFLICT` ensures duplicate `link` values are skipped.
+        2. Uses psycopg2.extras.execute_values to insert all rows in one round trip.
+           • The RETURNING clause yields only the IDs of rows that were
+             newly inserted (duplicates return nothing).
+        3. Commits the transaction.
+        4. If any rows were inserted, calls `notify_jobs` to send a notification
+           containing only those new rows that still have
+           application_status = 'pending'.
 
     Returns:
         None
 
     Raises:
-        Exception: Any database or notification errors will be raised 
-                   after logging.
+        Exception:
+            Any database or notification-related errors are propagated
+            after being printed to stdout.
     """
+
     try:
-        # Get DB connection
-        conn = db_connection()
-        cur = conn.cursor()
 
         # Insert query with conflict handling
         insert_query = """
             INSERT INTO jobs (title, link, published, author, category, fetched_at)
             VALUES %s
-            ON CONFLICT (link) DO NOTHING;
+            ON CONFLICT (link) DO NOTHING
+            RETURNING id;
         """
 
         # Prepare values as tuples
@@ -173,38 +202,38 @@ def insert_jobs(jobs, notification_title: str):
             )
             for job in jobs
         ]
+        print(values)
 
         # Bulk insert all jobs
-        execute_values(cur, insert_query, values)
-
+        new_jobs = execute_values(cur, insert_query, values, fetch=True)
         conn.commit()
-        print(f"{cur.rowcount} jobs inserted.")
+        
+        print(f"{len(new_jobs)} jobs inserted.")
+        print(new_jobs)
 
         # Send notifications for new pending jobs
-        notify_jobs(
-            conn=conn,
-            cur=cur,
-            query="""
-                SELECT id, title, link, published, author, category, fetched_at 
-                FROM jobs 
-                WHERE application_status = 'pending'
-            """,
-            notification_title=notification_title
-        )
+        new_job_ids = [row[0] for row in new_jobs]
+        print(new_job_ids)
+
+        if len(new_jobs) > 0:
+            notify_jobs(
+                cur=cur,
+                query="""
+                    SELECT id, title, link, published, author, category, fetched_at 
+                    FROM jobs 
+                    WHERE application_status = 'pending'
+                """,
+                notification_title=notification_title,
+                new_job_ids = new_job_ids
+            )
 
     except Exception as e:
         print("Error inserting jobs:", e)
         raise
-    finally:
-        # Ensure cleanup
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
 
 
 
-def send_reminders():
+def send_reminders(conn, cur):
     """
     Send reminder notifications for jobs that are still in 'pending' status
     and have received fewer than 15 reminders. Each reminder is logged in 
@@ -230,13 +259,8 @@ def send_reminders():
                    delivery are propagated.
     """
 
-    # get db conn
-    conn = db_connection()
-    cur = conn.cursor()
-
     # Notify pending jobs that have fewer than 15 reminders
     reminded_ids = notify_jobs(
-        conn=conn,
         cur=cur,
         query="""
             WITH reminder_count AS (
@@ -262,8 +286,5 @@ def send_reminders():
             "INSERT INTO reminders (job_id) VALUES (%s)",
             [(job_id,) for job_id in reminded_ids]
         )
-
-    conn.commit()
-    cur.close()
-    conn.close()
+        conn.commit()
 
