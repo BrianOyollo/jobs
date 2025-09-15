@@ -267,6 +267,3 @@ def send_reminders():
     cur.close()
     conn.close()
 
-
-
-send_reminders()
